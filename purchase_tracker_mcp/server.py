@@ -197,10 +197,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS categories (
-            name TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
             monthly_limit REAL CHECK (monthly_limit IS NULL OR monthly_limit >= 0),
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, name)
         );
 
         CREATE TABLE IF NOT EXISTS purchases (
@@ -223,14 +225,15 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_purchases_category ON purchases(category);
         CREATE INDEX IF NOT EXISTS idx_purchases_currency ON purchases(currency);
         CREATE INDEX IF NOT EXISTS idx_purchases_merchant ON purchases(merchant);
+        CREATE INDEX IF NOT EXISTS idx_categories_user_id_name ON categories(user_id, name);
         """
     )
 
-    columns = {
+    purchase_columns = {
         row["name"]
         for row in conn.execute("PRAGMA table_info(purchases)").fetchall()
     }
-    if "user_id" not in columns:
+    if "user_id" not in purchase_columns:
         conn.execute(
             "ALTER TABLE purchases ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'"
         )
@@ -238,25 +241,60 @@ def init_db(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_purchases_user_id ON purchases(user_id)"
         )
 
-    ts = now_iso()
-    conn.executemany(
-        """
-        INSERT OR IGNORE INTO categories(name, monthly_limit, created_at, updated_at)
-        VALUES (?, NULL, ?, ?)
-        """,
-        [(category, ts, ts) for category in DEFAULT_CATEGORIES],
-    )
+    category_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(categories)").fetchall()
+    }
+    if category_columns and "user_id" not in category_columns:
+        conn.executescript(
+            """
+            ALTER TABLE categories RENAME TO categories_legacy;
+
+            CREATE TABLE categories (
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                monthly_limit REAL CHECK (monthly_limit IS NULL OR monthly_limit >= 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, name)
+            );
+
+            CREATE INDEX idx_categories_user_id_name ON categories(user_id, name);
+
+            INSERT INTO categories(user_id, name, monthly_limit, created_at, updated_at)
+            SELECT 'default', name, monthly_limit, created_at, updated_at
+            FROM categories_legacy;
+
+            DROP TABLE categories_legacy;
+            """
+        )
+
     conn.commit()
 
 
-def ensure_category(conn: sqlite3.Connection, category: str) -> None:
+def seed_default_categories(conn: sqlite3.Connection, user_id: str) -> None:
+    normalized_user_id = normalize_user_id(user_id)
+    ts = now_iso()
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO categories(user_id, name, monthly_limit, created_at, updated_at)
+        VALUES (?, ?, NULL, ?, ?)
+        """,
+        [(normalized_user_id, category, ts, ts) for category in DEFAULT_CATEGORIES],
+    )
+
+
+
+def ensure_category(conn: sqlite3.Connection, user_id: str, category: str) -> None:
+    normalized_user_id = normalize_user_id(user_id)
+    seed_default_categories(conn, normalized_user_id)
     ts = now_iso()
     conn.execute(
         """
-        INSERT OR IGNORE INTO categories(name, monthly_limit, created_at, updated_at)
-        VALUES (?, NULL, ?, ?)
+        INSERT OR IGNORE INTO categories(user_id, name, monthly_limit, created_at, updated_at)
+        VALUES (?, ?, NULL, ?, ?)
         """,
-        (category, ts, ts),
+        (normalized_user_id, category, ts, ts),
     )
 
 
@@ -402,7 +440,7 @@ def add_purchase(
     ts = now_iso()
 
     with connect() as conn:
-        ensure_category(conn, normalized_category)
+        ensure_category(conn, normalized_user_id, normalized_category)
         cursor = conn.execute(
             """
             INSERT INTO purchases(
@@ -603,7 +641,7 @@ def update_purchase(
 
         if category is not None:
             normalized_category = normalize_category(category)
-            ensure_category(conn, normalized_category)
+            ensure_category(conn, normalized_user_id, normalized_category)
             updates.append("category = ?")
             params.append(normalized_category)
 
@@ -687,15 +725,21 @@ def delete_purchase(user_id: str, purchase_id: int) -> dict[str, Any]:
 
 
 @mcp.tool()
-def list_categories(include_usage: bool = True) -> dict[str, Any]:
+def list_categories(user_id: str, include_usage: bool = True) -> dict[str, Any]:
     """
-    Показать категории. Если include_usage=True, добавить количество и сумму покупок.
+    Показать категории пользователя. Если include_usage=True, добавить количество и сумму покупок.
     """
+    normalized_user_id = normalize_user_id(user_id)
+
     with connect() as conn:
+        seed_default_categories(conn, normalized_user_id)
+        conn.commit()
+
         if include_usage:
             rows = conn.execute(
                 """
                 SELECT
+                    c.user_id,
                     c.name,
                     c.monthly_limit,
                     c.created_at,
@@ -703,12 +747,16 @@ def list_categories(include_usage: bool = True) -> dict[str, Any]:
                     count(p.id) AS purchase_count,
                     coalesce(sum(p.amount), 0) AS total_amount
                 FROM categories c
-                LEFT JOIN purchases p ON p.category = c.name
-                GROUP BY c.name, c.monthly_limit, c.created_at, c.updated_at
+                LEFT JOIN purchases p
+                    ON p.user_id = c.user_id
+                    AND p.category = c.name
+                WHERE c.user_id = ?
+                GROUP BY c.user_id, c.name, c.monthly_limit, c.created_at, c.updated_at
 
                 UNION
 
                 SELECT
+                    p.user_id,
                     p.category AS name,
                     NULL AS monthly_limit,
                     NULL AS created_at,
@@ -716,17 +764,22 @@ def list_categories(include_usage: bool = True) -> dict[str, Any]:
                     count(p.id) AS purchase_count,
                     coalesce(sum(p.amount), 0) AS total_amount
                 FROM purchases p
-                LEFT JOIN categories c ON c.name = p.category
-                WHERE c.name IS NULL
-                GROUP BY p.category
+                LEFT JOIN categories c
+                    ON c.user_id = p.user_id
+                    AND c.name = p.category
+                WHERE p.user_id = ?
+                  AND c.name IS NULL
+                GROUP BY p.user_id, p.category
 
                 ORDER BY name
-                """
+                """,
+                (normalized_user_id, normalized_user_id),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
                 SELECT
+                    user_id,
                     name,
                     monthly_limit,
                     created_at,
@@ -734,8 +787,10 @@ def list_categories(include_usage: bool = True) -> dict[str, Any]:
                     NULL AS purchase_count,
                     NULL AS total_amount
                 FROM categories
+                WHERE user_id = ?
                 ORDER BY name
-                """
+                """,
+                (normalized_user_id,),
             ).fetchall()
 
     return {"ok": True, "items": [dict(row) for row in rows]}
@@ -743,30 +798,34 @@ def list_categories(include_usage: bool = True) -> dict[str, Any]:
 
 @mcp.tool()
 def upsert_category(
+    user_id: str,
     name: str,
     monthly_limit: float | None = None,
     clear_limit: bool = False,
 ) -> dict[str, Any]:
     """
-    Создать или обновить категорию.
+    Создать или обновить категорию пользователя.
 
     Args:
+        user_id: Идентификатор пользователя из Telegram/внешнего клиента.
         name: Название категории.
         monthly_limit: Месячный лимит по категории.
         clear_limit: Если True, очистить месячный лимит.
     """
+    normalized_user_id = normalize_user_id(user_id)
     normalized_name = normalize_category(name)
     if monthly_limit is not None and monthly_limit < 0:
         raise ValueError("monthly_limit не может быть отрицательным")
 
     ts = now_iso()
     with connect() as conn:
+        seed_default_categories(conn, normalized_user_id)
         conn.execute(
             """
-            INSERT OR IGNORE INTO categories(name, monthly_limit, created_at, updated_at)
-            VALUES (?, NULL, ?, ?)
+            INSERT OR IGNORE INTO categories(user_id, name, monthly_limit, created_at, updated_at)
+            VALUES (?, ?, NULL, ?, ?)
             """,
-            (normalized_name, ts, ts),
+            (normalized_user_id, normalized_name, ts, ts),
         )
 
         if clear_limit:
@@ -774,34 +833,35 @@ def upsert_category(
                 """
                 UPDATE categories
                 SET monthly_limit = NULL, updated_at = ?
-                WHERE name = ?
+                WHERE user_id = ? AND name = ?
                 """,
-                (ts, normalized_name),
+                (ts, normalized_user_id, normalized_name),
             )
         elif monthly_limit is not None:
             conn.execute(
                 """
                 UPDATE categories
                 SET monthly_limit = ?, updated_at = ?
-                WHERE name = ?
+                WHERE user_id = ? AND name = ?
                 """,
-                (float(monthly_limit), ts, normalized_name),
+                (float(monthly_limit), ts, normalized_user_id, normalized_name),
             )
 
         conn.commit()
         row = conn.execute(
-            "SELECT * FROM categories WHERE name = ?",
-            (normalized_name,),
+            "SELECT * FROM categories WHERE user_id = ? AND name = ?",
+            (normalized_user_id, normalized_name),
         ).fetchone()
 
     return {"ok": True, "category": dict(row)}
 
 
 @mcp.tool()
-def rename_category(old_name: str, new_name: str) -> dict[str, Any]:
+def rename_category(user_id: str, old_name: str, new_name: str) -> dict[str, Any]:
     """
-    Переименовать категорию и все покупки в этой категории.
+    Переименовать категорию пользователя и все его покупки в этой категории.
     """
+    normalized_user_id = normalize_user_id(user_id)
     old_value = normalize_category(old_name)
     new_value = normalize_category(new_name)
 
@@ -814,17 +874,18 @@ def rename_category(old_name: str, new_name: str) -> dict[str, Any]:
     ts = now_iso()
 
     with connect() as conn:
+        seed_default_categories(conn, normalized_user_id)
         old_row = conn.execute(
-            "SELECT * FROM categories WHERE name = ?",
-            (old_value,),
+            "SELECT * FROM categories WHERE user_id = ? AND name = ?",
+            (normalized_user_id, old_value),
         ).fetchone()
 
         if old_row is None:
             return {"ok": False, "error": f'Категория "{old_value}" не найдена'}
 
         existing_new = conn.execute(
-            "SELECT * FROM categories WHERE name = ?",
-            (new_value,),
+            "SELECT * FROM categories WHERE user_id = ? AND name = ?",
+            (normalized_user_id, new_value),
         ).fetchone()
 
         if existing_new is not None:
@@ -832,37 +893,46 @@ def rename_category(old_name: str, new_name: str) -> dict[str, Any]:
 
         conn.execute(
             """
-            INSERT INTO categories(name, monthly_limit, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO categories(user_id, name, monthly_limit, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (new_value, old_row["monthly_limit"], old_row["created_at"], ts),
+            (
+                normalized_user_id,
+                new_value,
+                old_row["monthly_limit"],
+                old_row["created_at"],
+                ts,
+            ),
         )
-        conn.execute("UPDATE purchases SET category = ? WHERE category = ?", (new_value, old_value))
-        conn.execute("DELETE FROM categories WHERE name = ?", (old_value,))
+        cursor = conn.execute(
+            "UPDATE purchases SET category = ? WHERE user_id = ? AND category = ?",
+            (new_value, normalized_user_id, old_value),
+        )
+        conn.execute(
+            "DELETE FROM categories WHERE user_id = ? AND name = ?",
+            (normalized_user_id, old_value),
+        )
         conn.commit()
-
-        moved_count = conn.execute(
-            "SELECT count(*) AS cnt FROM purchases WHERE category = ?",
-            (new_value,),
-        ).fetchone()["cnt"]
 
     return {
         "ok": True,
         "changed": True,
         "old_name": old_value,
         "new_name": new_value,
-        "moved_purchase_count": moved_count,
+        "moved_purchase_count": cursor.rowcount,
     }
 
 
 @mcp.tool()
 def delete_category(
+    user_id: str,
     name: str,
     move_purchases_to: str = "Без категории",
 ) -> dict[str, Any]:
     """
-    Удалить категорию. Покупки из неё будут перенесены в move_purchases_to.
+    Удалить категорию пользователя. Покупки из неё будут перенесены в move_purchases_to.
     """
+    normalized_user_id = normalize_user_id(user_id)
     category_name = normalize_category(name)
     target_name = normalize_category(move_purchases_to)
 
@@ -870,21 +940,25 @@ def delete_category(
         return {"ok": False, "error": 'Категорию "Без категории" удалять нельзя'}
 
     with connect() as conn:
+        seed_default_categories(conn, normalized_user_id)
         row = conn.execute(
-            "SELECT * FROM categories WHERE name = ?",
-            (category_name,),
+            "SELECT * FROM categories WHERE user_id = ? AND name = ?",
+            (normalized_user_id, category_name),
         ).fetchone()
         if row is None:
             return {"ok": False, "error": f'Категория "{category_name}" не найдена'}
 
-        ensure_category(conn, target_name)
+        ensure_category(conn, normalized_user_id, target_name)
         cursor = conn.execute(
-            "UPDATE purchases SET category = ? WHERE category = ?",
-            (target_name, category_name),
+            "UPDATE purchases SET category = ? WHERE user_id = ? AND category = ?",
+            (target_name, normalized_user_id, category_name),
         )
         moved_count = cursor.rowcount
 
-        conn.execute("DELETE FROM categories WHERE name = ?", (category_name,))
+        conn.execute(
+            "DELETE FROM categories WHERE user_id = ? AND name = ?",
+            (normalized_user_id, category_name),
+        )
         conn.commit()
 
     return {
@@ -1005,18 +1079,21 @@ def monthly_budget_report(
     period = f"{year:04d}-{month:02d}"
 
     with connect() as conn:
+        seed_default_categories(conn, normalized_user_id)
+        conn.commit()
         rows = conn.execute(
             """
             SELECT
                 c.name AS category,
                 c.monthly_limit,
                 coalesce(sum(CASE WHEN p.currency = ? THEN p.amount ELSE 0 END), 0) AS spent,
-                count(p.id) AS purchase_count
+                count(CASE WHEN p.currency = ? THEN p.id END) AS purchase_count
             FROM categories c
             LEFT JOIN purchases p
                 ON p.category = c.name
-                AND p.user_id = ?
+                AND p.user_id = c.user_id
                 AND substr(p.spent_at, 1, 7) = ?
+            WHERE c.user_id = ?
             GROUP BY c.name, c.monthly_limit
 
             UNION
@@ -1027,7 +1104,9 @@ def monthly_budget_report(
                 coalesce(sum(p.amount), 0) AS spent,
                 count(p.id) AS purchase_count
             FROM purchases p
-            LEFT JOIN categories c ON c.name = p.category
+            LEFT JOIN categories c
+                ON c.user_id = p.user_id
+                AND c.name = p.category
             WHERE c.name IS NULL
               AND p.user_id = ?
               AND p.currency = ?
@@ -1038,8 +1117,9 @@ def monthly_budget_report(
             """,
             (
                 normalized_currency,
-                normalized_user_id,
+                normalized_currency,
                 period,
+                normalized_user_id,
                 normalized_user_id,
                 normalized_currency,
                 period,
@@ -1152,8 +1232,8 @@ def import_purchases_csv(
 
     Ожидаемые колонки:
     amount, category, description, merchant, spent_at, currency, payment_method, tags.
-    Дополнительно может быть колонка user_id: если она есть и не пустая, будет использована она,
-    иначе возьмётся user_id из аргумента tool.
+    Колонка user_id в CSV игнорируется: импорт всегда идёт в user_id из аргумента tool,
+    чтобы не смешивать данные разных пользователей в одном вызове.
 
     Минимально обязательна только amount.
     """
@@ -1177,15 +1257,14 @@ def import_purchases_csv(
                 if amount <= 0:
                     raise ValueError("amount должен быть больше 0")
 
-                csv_user_id = (row.get("user_id") or "").strip()
-                effective_user_id = normalize_user_id(csv_user_id or normalized_default_user_id)
+                effective_user_id = normalized_default_user_id
                 category = normalize_category(row.get("category"))
                 currency = normalize_currency(row.get("currency") or default_currency)
                 spent_at = normalize_datetime(row.get("spent_at") or None)
                 tags = normalize_tags(row.get("tags") or None)
                 ts = now_iso()
 
-                ensure_category(conn, category)
+                ensure_category(conn, effective_user_id, category)
                 conn.execute(
                     """
                     INSERT INTO purchases(
@@ -1278,15 +1357,6 @@ def purge_all_data(confirm: str) -> dict[str, Any]:
         purchase_count = conn.execute("SELECT count(*) AS cnt FROM purchases").fetchone()["cnt"]
         conn.execute("DELETE FROM purchases")
         conn.execute("DELETE FROM categories")
-
-        ts = now_iso()
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO categories(name, monthly_limit, created_at, updated_at)
-            VALUES (?, NULL, ?, ?)
-            """,
-            [(category, ts, ts) for category in DEFAULT_CATEGORIES],
-        )
         conn.commit()
 
     return {"ok": True, "deleted_purchase_count": purchase_count}
@@ -1315,10 +1385,12 @@ def purchases_schema() -> str:
                 "updated_at": "TEXT, ISO datetime",
             },
             "categories": {
-                "name": "TEXT PRIMARY KEY",
+                "user_id": "TEXT, идентификатор пользователя/чата",
+                "name": "TEXT, название категории",
                 "monthly_limit": "REAL NULL, месячный лимит",
                 "created_at": "TEXT, ISO datetime",
                 "updated_at": "TEXT, ISO datetime",
+                "primary_key": "(user_id, name)",
             },
         },
     }
