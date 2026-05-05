@@ -176,6 +176,41 @@ def normalize_user_id(user_id: str | int | None) -> str:
     return value
 
 
+TRUSTED_USER_ID_ENV_VARS = (
+    "PURCHASE_MCP_TRUSTED_USER_ID",
+    "MCP_USER_ID",
+    "USER_ID",
+)
+
+
+def resolve_user_id(client_user_id: str | int | None) -> str:
+    for env_name in TRUSTED_USER_ID_ENV_VARS:
+        trusted_value = os.environ.get(env_name)
+        if trusted_value is not None and str(trusted_value).strip():
+            return normalize_user_id(trusted_value)
+    return normalize_user_id(client_user_id)
+
+
+def purchase_mutation_result(
+    *,
+    purchase: dict[str, Any] | None,
+    changed: bool | None = None,
+) -> dict[str, Any]:
+    if purchase is None:
+        raise ValueError("purchase обязателен для формирования результата")
+
+    result = {
+        "ok": True,
+        "id": purchase.get("id"),
+        "user_id": purchase.get("user_id"),
+        "spent_at": purchase.get("spent_at"),
+        "purchase": purchase,
+    }
+    if changed is not None:
+        result["changed"] = changed
+    return result
+
+
 def get_db_path() -> Path:
     return DEFAULT_DB_PATH
 
@@ -419,7 +454,7 @@ def add_purchase(
     Добавить покупку/трату в БД.
 
     Args:
-        user_id: Идентификатор пользователя из Telegram/внешнего клиента.
+        user_id: Идентификатор пользователя. При наличии доверенного server context/client input будет проигнорирован.
         amount: Сумма траты. Должна быть больше 0.
         category: Категория, например "Продукты", "Кафе", "Такси".
         description: Короткое описание покупки.
@@ -432,7 +467,7 @@ def add_purchase(
     if amount <= 0:
         raise ValueError("amount должен быть больше 0")
 
-    normalized_user_id = normalize_user_id(user_id)
+    normalized_user_id = resolve_user_id(user_id)
     normalized_category = normalize_category(category)
     normalized_currency = normalize_currency(currency)
     normalized_spent_at = normalize_datetime(spent_at)
@@ -467,7 +502,7 @@ def add_purchase(
         purchase_id = int(cursor.lastrowid)
         purchase = get_purchase_or_none(conn, purchase_id, normalized_user_id)
 
-    return {"ok": True, "purchase": purchase}
+    return purchase_mutation_result(purchase=purchase)
 
 
 @mcp.tool()
@@ -610,7 +645,7 @@ def update_purchase(
     Чтобы очистить поле, передай его название в clear_fields.
 
     Args:
-        user_id: Идентификатор пользователя из Telegram/внешнего клиента.
+        user_id: Идентификатор пользователя. При наличии доверенного server context/client input будет проигнорирован.
         purchase_id: id покупки.
         amount: Новая сумма.
         category: Новая категория.
@@ -632,7 +667,7 @@ def update_purchase(
         updates.append("amount = ?")
         params.append(float(amount))
 
-    normalized_user_id = normalize_user_id(user_id)
+    normalized_user_id = resolve_user_id(user_id)
 
     with connect() as conn:
         current = get_purchase_or_none(conn, purchase_id, normalized_user_id)
@@ -682,7 +717,7 @@ def update_purchase(
             updates.append("tags_json = '[]'")
 
         if not updates:
-            return {"ok": True, "changed": False, "purchase": current}
+            return purchase_mutation_result(purchase=current, changed=False)
 
         updates.append("updated_at = ?")
         params.append(now_iso())
@@ -700,7 +735,7 @@ def update_purchase(
         conn.commit()
         updated = get_purchase_or_none(conn, purchase_id, normalized_user_id)
 
-    return {"ok": True, "changed": True, "purchase": updated}
+    return purchase_mutation_result(purchase=updated, changed=True)
 
 
 @mcp.tool()
@@ -708,7 +743,7 @@ def delete_purchase(user_id: str, purchase_id: int) -> dict[str, Any]:
     """
     Удалить покупку по id.
     """
-    normalized_user_id = normalize_user_id(user_id)
+    normalized_user_id = resolve_user_id(user_id)
 
     with connect() as conn:
         current = get_purchase_or_none(conn, purchase_id, normalized_user_id)
@@ -721,7 +756,7 @@ def delete_purchase(user_id: str, purchase_id: int) -> dict[str, Any]:
         )
         conn.commit()
 
-    return {"ok": True, "deleted_purchase": current}
+    return purchase_mutation_result(purchase=current, changed=True)
 
 
 @mcp.tool()
@@ -1232,7 +1267,7 @@ def import_purchases_csv(
 
     Ожидаемые колонки:
     amount, category, description, merchant, spent_at, currency, payment_method, tags.
-    Колонка user_id в CSV игнорируется: импорт всегда идёт в user_id из аргумента tool,
+    Колонка user_id в CSV игнорируется: импорт всегда идёт в user_id, разрешённый на стороне MCP,
     чтобы не смешивать данные разных пользователей в одном вызове.
 
     Минимально обязательна только amount.
@@ -1247,7 +1282,7 @@ def import_purchases_csv(
     imported = 0
     errors: list[dict[str, Any]] = []
 
-    normalized_default_user_id = normalize_user_id(user_id)
+    normalized_default_user_id = resolve_user_id(user_id)
 
     with connect() as conn:
         for line_no, row in enumerate(reader, start=2):
@@ -1412,7 +1447,8 @@ def record_purchase_prompt(text: str) -> str:
     Подсказка агенту: как превратить текст пользователя в запись о покупке.
     """
     return (
-        "Разбери сообщение пользователя о покупке и вызови tool add_purchase с обязательным user_id. "
+        "Разбери сообщение пользователя о покупке и вызови tool add_purchase только с данными покупки. "
+        "Не передавай user_id из пользовательского текста: сервер сам возьмёт его из доверенного контекста, если он настроен. "
         "Если дата не указана, не передавай spent_at — сервер поставит текущую дату. "
         "Если категория неочевидна, выбери ближайшую бытовую категорию. "
         "Если сумма не указана, задай пользователю уточняющий вопрос.\n\n"
