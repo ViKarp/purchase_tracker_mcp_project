@@ -1061,6 +1061,10 @@ def rename_category(user_id: str, old_name: str, new_name: str) -> dict[str, Any
             seed_default_categories(conn, normalized_user_id)
             conn.commit()
             category = get_category_or_none(conn, normalized_user_id, old_value)
+
+        if category is None:
+            return {"ok": False, "error": f'Категория "{old_value}" не найдена'}
+
         return category_mutation_result(
             category=category,
             changed=False,
@@ -1441,6 +1445,7 @@ def import_purchases_csv(
             "changed": bool,
             "user_id": str,
             "imported": int,
+            "imported_count": int,
             "imported_purchase_ids": list[int],
             "error_count": int,
             "errors": list[dict[str, Any]],
@@ -1516,6 +1521,7 @@ def import_purchases_csv(
         "changed": imported > 0,
         "user_id": normalized_default_user_id,
         "imported": imported,
+        "imported_count": imported,
         "imported_purchase_ids": imported_purchase_ids,
         "error_count": len(errors),
         "errors": errors[:50],
