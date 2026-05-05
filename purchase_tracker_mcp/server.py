@@ -176,19 +176,6 @@ def normalize_user_id(user_id: str | int | None) -> str:
     return value
 
 
-TRUSTED_USER_ID_ENV_VARS = (
-    "PURCHASE_MCP_TRUSTED_USER_ID",
-    "MCP_USER_ID",
-    "USER_ID",
-)
-
-
-def resolve_user_id(client_user_id: str | int | None) -> str:
-    for env_name in TRUSTED_USER_ID_ENV_VARS:
-        trusted_value = os.environ.get(env_name)
-        if trusted_value is not None and str(trusted_value).strip():
-            return normalize_user_id(trusted_value)
-    return normalize_user_id(client_user_id)
 
 
 def purchase_mutation_result(
@@ -454,7 +441,7 @@ def add_purchase(
     Добавить покупку/трату в БД.
 
     Args:
-        user_id: Идентификатор пользователя. При наличии доверенного server context/client input будет проигнорирован.
+        user_id: Идентификатор пользователя, который агент уже подставляет из реального Telegram id.
         amount: Сумма траты. Должна быть больше 0.
         category: Категория, например "Продукты", "Кафе", "Такси".
         description: Короткое описание покупки.
@@ -467,7 +454,7 @@ def add_purchase(
     if amount <= 0:
         raise ValueError("amount должен быть больше 0")
 
-    normalized_user_id = resolve_user_id(user_id)
+    normalized_user_id = normalize_user_id(user_id)
     normalized_category = normalize_category(category)
     normalized_currency = normalize_currency(currency)
     normalized_spent_at = normalize_datetime(spent_at)
@@ -645,7 +632,7 @@ def update_purchase(
     Чтобы очистить поле, передай его название в clear_fields.
 
     Args:
-        user_id: Идентификатор пользователя. При наличии доверенного server context/client input будет проигнорирован.
+        user_id: Идентификатор пользователя, который агент уже подставляет из реального Telegram id.
         purchase_id: id покупки.
         amount: Новая сумма.
         category: Новая категория.
@@ -667,7 +654,7 @@ def update_purchase(
         updates.append("amount = ?")
         params.append(float(amount))
 
-    normalized_user_id = resolve_user_id(user_id)
+    normalized_user_id = normalize_user_id(user_id)
 
     with connect() as conn:
         current = get_purchase_or_none(conn, purchase_id, normalized_user_id)
@@ -743,7 +730,7 @@ def delete_purchase(user_id: str, purchase_id: int) -> dict[str, Any]:
     """
     Удалить покупку по id.
     """
-    normalized_user_id = resolve_user_id(user_id)
+    normalized_user_id = normalize_user_id(user_id)
 
     with connect() as conn:
         current = get_purchase_or_none(conn, purchase_id, normalized_user_id)
@@ -1267,7 +1254,7 @@ def import_purchases_csv(
 
     Ожидаемые колонки:
     amount, category, description, merchant, spent_at, currency, payment_method, tags.
-    Колонка user_id в CSV игнорируется: импорт всегда идёт в user_id, разрешённый на стороне MCP,
+    Колонка user_id в CSV игнорируется: импорт всегда идёт в user_id, который агент передал в вызове,
     чтобы не смешивать данные разных пользователей в одном вызове.
 
     Минимально обязательна только amount.
@@ -1282,7 +1269,7 @@ def import_purchases_csv(
     imported = 0
     errors: list[dict[str, Any]] = []
 
-    normalized_default_user_id = resolve_user_id(user_id)
+    normalized_default_user_id = normalize_user_id(user_id)
 
     with connect() as conn:
         for line_no, row in enumerate(reader, start=2):
@@ -1448,7 +1435,7 @@ def record_purchase_prompt(text: str) -> str:
     """
     return (
         "Разбери сообщение пользователя о покупке и вызови tool add_purchase только с данными покупки. "
-        "Не передавай user_id из пользовательского текста: сервер сам возьмёт его из доверенного контекста, если он настроен. "
+        "Не передавай user_id из пользовательского текста: агент сам должен подставить реальный Telegram id. "
         "Если дата не указана, не передавай spent_at — сервер поставит текущую дату. "
         "Если категория неочевидна, выбери ближайшую бытовую категорию. "
         "Если сумма не указана, задай пользователю уточняющий вопрос.\n\n"
