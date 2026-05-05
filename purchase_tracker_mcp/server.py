@@ -188,14 +188,55 @@ def purchase_mutation_result(
 
     result = {
         "ok": True,
+        "changed": True if changed is None else changed,
         "id": purchase.get("id"),
         "user_id": purchase.get("user_id"),
         "spent_at": purchase.get("spent_at"),
         "purchase": purchase,
     }
-    if changed is not None:
-        result["changed"] = changed
     return result
+
+
+
+def category_mutation_result(
+    *,
+    category: dict[str, Any] | None,
+    changed: bool = True,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if category is None:
+        raise ValueError("category обязателен для формирования результата")
+
+    result = {
+        "ok": True,
+        "changed": changed,
+        "user_id": category.get("user_id"),
+        "category_name": category.get("name"),
+        "category": category,
+    }
+    if extra:
+        result.update(extra)
+    return result
+
+
+
+def category_deletion_result(
+    *,
+    user_id: str,
+    deleted_name: str,
+    move_purchases_to: str,
+    moved_purchase_count: int,
+    changed: bool = True,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "changed": changed,
+        "user_id": user_id,
+        "category_name": deleted_name,
+        "deleted_category": deleted_name,
+        "move_purchases_to": move_purchases_to,
+        "moved_purchase_count": moved_purchase_count,
+    }
 
 
 def get_db_path() -> Path:
@@ -334,6 +375,21 @@ def get_purchase_or_none(
     return row_to_purchase(row)
 
 
+
+def get_category_or_none(
+    conn: sqlite3.Connection,
+    user_id: str,
+    name: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM categories WHERE user_id = ? AND name = ?",
+        (normalize_user_id(user_id), normalize_category(name)),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
 def build_purchase_where(
     user_id: str,
     *,
@@ -450,6 +506,15 @@ def add_purchase(
         currency: Валюта, по умолчанию RUB.
         payment_method: Способ оплаты, например "карта", "наличные", "СБП".
         tags: Список тегов или строка с тегами через запятую.
+    Success contract:
+        {
+            "ok": True,
+            "changed": bool,
+            "id": int,
+            "user_id": str,
+            "spent_at": str,
+            "purchase": {...},
+        }
     """
     if amount <= 0:
         raise ValueError("amount должен быть больше 0")
@@ -631,6 +696,16 @@ def update_purchase(
     Обновить покупку по id. Поля со значением None не меняются.
     Чтобы очистить поле, передай его название в clear_fields.
 
+    Success contract:
+        {
+            "ok": True,
+            "changed": bool,
+            "id": int,
+            "user_id": str,
+            "spent_at": str,
+            "purchase": {...},
+        }
+
     Args:
         user_id: Идентификатор пользователя, который агент уже подставляет из реального Telegram id.
         purchase_id: id покупки.
@@ -729,6 +804,16 @@ def update_purchase(
 def delete_purchase(user_id: str, purchase_id: int) -> dict[str, Any]:
     """
     Удалить покупку по id.
+
+    Success contract:
+        {
+            "ok": True,
+            "changed": bool,
+            "id": int,
+            "user_id": str,
+            "spent_at": str,
+            "purchase": {...},
+        }
     """
     normalized_user_id = normalize_user_id(user_id)
 
@@ -744,6 +829,25 @@ def delete_purchase(user_id: str, purchase_id: int) -> dict[str, Any]:
         conn.commit()
 
     return purchase_mutation_result(purchase=current, changed=True)
+
+
+@mcp.tool()
+def get_category(user_id: str, name: str) -> dict[str, Any]:
+    """
+    Получить одну категорию пользователя по имени.
+    """
+    normalized_user_id = normalize_user_id(user_id)
+    normalized_name = normalize_category(name)
+
+    with connect() as conn:
+        seed_default_categories(conn, normalized_user_id)
+        conn.commit()
+        category = get_category_or_none(conn, normalized_user_id, normalized_name)
+
+    if category is None:
+        return {"ok": False, "error": f'Категория "{normalized_name}" не найдена'}
+
+    return {"ok": True, "category": category}
 
 
 @mcp.tool()
@@ -819,6 +923,44 @@ def list_categories(user_id: str, include_usage: bool = True) -> dict[str, Any]:
 
 
 @mcp.tool()
+def count_purchases(
+    user_id: str,
+    category: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    currency: str | None = None,
+) -> dict[str, Any]:
+    """
+    Посчитать количество покупок и их суммарную сумму с базовыми фильтрами.
+    """
+    where_sql, params = build_purchase_where(
+        normalize_user_id(user_id),
+        start_date=start_date,
+        end_date=end_date,
+        category=category,
+        currency=currency,
+    )
+
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT
+                count(*) AS count,
+                coalesce(round(sum(amount), 2), 0) AS total_amount
+            FROM purchases
+            {where_sql}
+            """,
+            params,
+        ).fetchone()
+
+    return {
+        "ok": True,
+        "count": int(row["count"]),
+        "total_amount": float(row["total_amount"] or 0),
+    }
+
+
+@mcp.tool()
 def upsert_category(
     user_id: str,
     name: str,
@@ -827,6 +969,21 @@ def upsert_category(
 ) -> dict[str, Any]:
     """
     Создать или обновить категорию пользователя.
+
+    Success contract:
+        {
+            "ok": True,
+            "changed": bool,
+            "user_id": str,
+            "category_name": str,
+            "category": {
+                "user_id": str,
+                "name": str,
+                "monthly_limit": float | None,
+                "created_at": str,
+                "updated_at": str,
+            },
+        }
 
     Args:
         user_id: Идентификатор пользователя из Telegram/внешнего клиента.
@@ -870,18 +1027,27 @@ def upsert_category(
             )
 
         conn.commit()
-        row = conn.execute(
-            "SELECT * FROM categories WHERE user_id = ? AND name = ?",
-            (normalized_user_id, normalized_name),
-        ).fetchone()
+        category = get_category_or_none(conn, normalized_user_id, normalized_name)
 
-    return {"ok": True, "category": dict(row)}
+    return category_mutation_result(category=category)
 
 
 @mcp.tool()
 def rename_category(user_id: str, old_name: str, new_name: str) -> dict[str, Any]:
     """
     Переименовать категорию пользователя и все его покупки в этой категории.
+
+    Success contract:
+        {
+            "ok": True,
+            "changed": bool,
+            "user_id": str,
+            "category_name": str,
+            "category": {...},
+            "old_name": str,
+            "new_name": str,
+            "moved_purchase_count": int,
+        }
     """
     normalized_user_id = normalize_user_id(user_id)
     old_value = normalize_category(old_name)
@@ -891,24 +1057,30 @@ def rename_category(user_id: str, old_name: str, new_name: str) -> dict[str, Any
         return {"ok": False, "error": 'Категорию "Без категории" переименовывать нельзя'}
 
     if old_value == new_value:
-        return {"ok": True, "changed": False, "category": old_value}
+        with connect() as conn:
+            seed_default_categories(conn, normalized_user_id)
+            conn.commit()
+            category = get_category_or_none(conn, normalized_user_id, old_value)
+        return category_mutation_result(
+            category=category,
+            changed=False,
+            extra={
+                "old_name": old_value,
+                "new_name": new_value,
+                "moved_purchase_count": 0,
+            },
+        )
 
     ts = now_iso()
 
     with connect() as conn:
         seed_default_categories(conn, normalized_user_id)
-        old_row = conn.execute(
-            "SELECT * FROM categories WHERE user_id = ? AND name = ?",
-            (normalized_user_id, old_value),
-        ).fetchone()
+        old_row = get_category_or_none(conn, normalized_user_id, old_value)
 
         if old_row is None:
             return {"ok": False, "error": f'Категория "{old_value}" не найдена'}
 
-        existing_new = conn.execute(
-            "SELECT * FROM categories WHERE user_id = ? AND name = ?",
-            (normalized_user_id, new_value),
-        ).fetchone()
+        existing_new = get_category_or_none(conn, normalized_user_id, new_value)
 
         if existing_new is not None:
             return {"ok": False, "error": f'Категория "{new_value}" уже существует'}
@@ -936,13 +1108,16 @@ def rename_category(user_id: str, old_name: str, new_name: str) -> dict[str, Any
         )
         conn.commit()
 
-    return {
-        "ok": True,
-        "changed": True,
-        "old_name": old_value,
-        "new_name": new_value,
-        "moved_purchase_count": cursor.rowcount,
-    }
+        category = get_category_or_none(conn, normalized_user_id, new_value)
+
+    return category_mutation_result(
+        category=category,
+        extra={
+            "old_name": old_value,
+            "new_name": new_value,
+            "moved_purchase_count": cursor.rowcount,
+        },
+    )
 
 
 @mcp.tool()
@@ -953,6 +1128,17 @@ def delete_category(
 ) -> dict[str, Any]:
     """
     Удалить категорию пользователя. Покупки из неё будут перенесены в move_purchases_to.
+
+    Success contract:
+        {
+            "ok": True,
+            "changed": bool,
+            "user_id": str,
+            "category_name": str,
+            "deleted_category": str,
+            "move_purchases_to": str,
+            "moved_purchase_count": int,
+        }
     """
     normalized_user_id = normalize_user_id(user_id)
     category_name = normalize_category(name)
@@ -963,11 +1149,8 @@ def delete_category(
 
     with connect() as conn:
         seed_default_categories(conn, normalized_user_id)
-        row = conn.execute(
-            "SELECT * FROM categories WHERE user_id = ? AND name = ?",
-            (normalized_user_id, category_name),
-        ).fetchone()
-        if row is None:
+        category = get_category_or_none(conn, normalized_user_id, category_name)
+        if category is None:
             return {"ok": False, "error": f'Категория "{category_name}" не найдена'}
 
         ensure_category(conn, normalized_user_id, target_name)
@@ -983,12 +1166,12 @@ def delete_category(
         )
         conn.commit()
 
-    return {
-        "ok": True,
-        "deleted_category": category_name,
-        "moved_purchase_count": moved_count,
-        "move_purchases_to": target_name,
-    }
+    return category_deletion_result(
+        user_id=normalized_user_id,
+        deleted_name=category_name,
+        move_purchases_to=target_name,
+        moved_purchase_count=moved_count,
+    )
 
 
 @mcp.tool()
@@ -1252,6 +1435,17 @@ def import_purchases_csv(
     """
     Импортировать покупки из CSV-строки.
 
+    Success contract:
+        {
+            "ok": bool,
+            "changed": bool,
+            "user_id": str,
+            "imported": int,
+            "imported_purchase_ids": list[int],
+            "error_count": int,
+            "errors": list[dict[str, Any]],
+        }
+
     Ожидаемые колонки:
     amount, category, description, merchant, spent_at, currency, payment_method, tags.
     Колонка user_id в CSV игнорируется: импорт всегда идёт в user_id, который агент передал в вызове,
@@ -1267,6 +1461,7 @@ def import_purchases_csv(
         return {"ok": False, "error": "Не удалось прочитать заголовок CSV"}
 
     imported = 0
+    imported_purchase_ids: list[int] = []
     errors: list[dict[str, Any]] = []
 
     normalized_default_user_id = normalize_user_id(user_id)
@@ -1287,7 +1482,7 @@ def import_purchases_csv(
                 ts = now_iso()
 
                 ensure_category(conn, effective_user_id, category)
-                conn.execute(
+                cursor = conn.execute(
                     """
                     INSERT INTO purchases(
                         user_id, amount, currency, category, merchant, description,
@@ -1310,6 +1505,7 @@ def import_purchases_csv(
                     ),
                 )
                 imported += 1
+                imported_purchase_ids.append(int(cursor.lastrowid))
             except Exception as exc:
                 errors.append({"line": line_no, "error": str(exc), "row": dict(row)})
 
@@ -1317,7 +1513,10 @@ def import_purchases_csv(
 
     return {
         "ok": len(errors) == 0,
+        "changed": imported > 0,
+        "user_id": normalized_default_user_id,
         "imported": imported,
+        "imported_purchase_ids": imported_purchase_ids,
         "error_count": len(errors),
         "errors": errors[:50],
     }
@@ -1367,6 +1566,13 @@ def purge_all_data(confirm: str) -> dict[str, Any]:
     """
     Полностью очистить покупки и пользовательские категории.
 
+    Success contract:
+        {
+            "ok": True,
+            "changed": bool,
+            "deleted_purchase_count": int,
+        }
+
     Защита от случайного вызова: confirm должен быть ровно DELETE ALL PURCHASE DATA.
     """
     if confirm != "DELETE ALL PURCHASE DATA":
@@ -1381,7 +1587,11 @@ def purge_all_data(confirm: str) -> dict[str, Any]:
         conn.execute("DELETE FROM categories")
         conn.commit()
 
-    return {"ok": True, "deleted_purchase_count": purchase_count}
+    return {
+        "ok": True,
+        "changed": purchase_count > 0,
+        "deleted_purchase_count": purchase_count,
+    }
 
 
 @mcp.resource("purchases://schema")
